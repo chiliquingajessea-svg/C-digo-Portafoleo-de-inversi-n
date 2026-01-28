@@ -1,0 +1,176 @@
+%% cap4_pipeline.m
+% Pipeline Markowitz + Monte Carlo
+% Equivalente al script en R
+
+clear; clc; close all;
+
+%% 1. Cargar ambos Excel
+
+data1 = readtable('data_parte1.xlsx');
+data2 = readtable('data_parte2.xlsx');
+
+rng(123); % set.seed equivalente
+
+%% 2. Unificar datos
+
+% Normalizar nombres de columnas
+data1.Properties.VariableNames(strcmp(data1.Properties.VariableNames,"BANCO")) = ...
+    "INST_ABRV";
+
+% Asegurar formato fecha
+data1.FECHA = datetime(data1.FECHA);
+data2.FECHA = datetime(data2.FECHA);
+
+% LEFT JOIN
+df_left = outerjoin(data1, data2, ...
+    "Keys",["FECHA","INST_ABRV"], ...
+    "MergeKeys",true, ...
+    "Type","left");
+
+% INNER JOIN
+df = innerjoin(data1, data2, ...
+    "Keys",["FECHA","INST_ABRV"]);
+
+disp(size(df))
+disp(df.Properties.VariableNames)
+
+%% 3. Crear estructura compatible Markowitz
+
+df_mk = table( ...
+    df.FECHA, ...
+    df.INST_ABRV, ...
+    df.ROA_data1, ...
+    'VariableNames', {'date','ticker','price'});
+
+% Limpieza básica
+df_mk = df_mk(~isnan(df_mk.price), :);
+df_mk = sortrows(df_mk, {'ticker','date'});
+
+%% 4. Crear tabla wide (fecha × banco)
+
+price_wide = unstack(df_mk, 'price', 'ticker');
+
+dates = price_wide.date;
+price_wide.date = [];
+
+R = table2array(price_wide);
+
+% Eliminar activos con demasiados NA
+keep = mean(isnan(R)) < 0.2;
+
+asset_names = price_wide.Properties.VariableNames(keep);
+
+R = R(:, keep);
+
+% Omitir filas incompletas
+R = R(all(~isnan(R),2), :);
+
+%% 5. Estadística descriptiva (mensual → anual)
+
+mu = mean(R)' * 12;           % retornos esperados
+Sigma = cov(R) * 12;          % covarianza anual
+
+%% 6. Frontera eficiente (Markowitz)
+
+n = length(mu);
+n_points = 50;
+rets = linspace(min(mu)*0.5, max(mu)*1.1, n_points);
+
+weights_mat = NaN(n, n_points);
+vars = NaN(n_points,1);
+
+% Restricción suma pesos = 1
+Aeq1 = ones(1,n);
+beq1 = 1;
+
+options = optimoptions('quadprog','Display','off');
+
+for i = 1:n_points
+    % Restricción retorno objetivo
+    Aeq = [Aeq1; mu'];
+    beq = [beq1; rets(i)];
+
+    w = quadprog(2*Sigma, zeros(n,1), [], [], Aeq, beq, [], [], [], options);
+    weights_mat(:,i) = w;
+    vars(i) = w' * Sigma * w;
+end
+
+sd_vals = sqrt(vars);
+
+%% 7. Portafolio tangente (máx Sharpe)
+
+rf = 0.02;   % tasa libre de riesgo anual
+excess_mu = mu - rf;
+
+Aeq = ones(1,n);
+beq = 1;
+
+Aineq = -excess_mu';
+bineq = 0;
+
+w_tangent = quadprog(2*Sigma, zeros(n,1), Aineq, bineq, Aeq, beq, [], [], [], options);
+
+% Normalizar
+w_tangent = w_tangent / sum(w_tangent);
+
+%% 8. Simulación Monte Carlo
+
+n_sim = 5000;
+
+sim_returns = mvnrnd(mu, Sigma, n_sim);
+
+port_ret_sim = sim_returns * w_tangent;
+
+VaR_95  = quantile(port_ret_sim, 0.05);
+CVaR_95 = mean(port_ret_sim(port_ret_sim <= VaR_95));
+
+%% 9. Visualizaciones
+
+% Frontera eficiente
+figure;
+plot(sd_vals, rets, 'LineWidth',2);
+xlabel('Volatilidad (anual)');
+ylabel('Rendimiento esperado (anual)');
+title('Frontera eficiente');
+grid on;
+
+% Histograma portafolio tangente
+figure;
+histogram(port_ret_sim, 50);
+xlabel('Rendimiento del portafolio (simulado)');
+ylabel('Frecuencia');
+title('Distribución Monte Carlo – Portafolio tangente');
+
+%% 10. Guardar resultados
+
+writematrix(weights_mat, "weights_frontier.csv");
+writetable(table(port_ret_sim), "sim_port_tangent.csv");
+
+save("params_processed.mat", "mu", "Sigma", "w_tangent");
+
+%% 11. Resultados principales
+
+disp('--- RESULTADOS PRINCIPALES ---')
+disp(mu)
+disp(VaR_95)
+disp(CVaR_95)
+
+disp('Pesos portafolio tangente:')
+disp(w_tangent)
+
+%% 12. Tabla de rendimientos esperados
+
+%% 12. Tabla de rendimientos esperados (CORREGIDA)
+
+sigma = sqrt(diag(Sigma));
+
+tabla_rendimientos = table( ...
+    asset_names', ...
+    round(mu,4), ...
+    round(sigma,4), ...
+    'VariableNames', {'Activo','Rendimiento_Esperado_Anual','Volatilidad_Anual'});
+
+disp(tabla_rendimientos)
+
+writetable(tabla_rendimientos, "tabla_rendimientos_esperados.csv");
+
